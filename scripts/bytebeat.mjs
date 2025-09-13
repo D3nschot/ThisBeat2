@@ -96,15 +96,19 @@ globalThis.bytebeat = new class {
 		}
 		const buffer = this.drawBuffer;
 		const bufferLen = buffer.length;
+		// If there's no drawBuffer data, allow rendering for analyser-driven modes
 		if (!bufferLen) {
-			return;
+			const dm = this.settings.drawMode;
+			if (dm !== 'FFT_1024') {
+				return;
+			}
 		}
 		const redColor = 100;
 		const width = this.canvasWidth;
 		const height = this.canvasHeight;
 		const scale = this.settings.drawScale;
 		const isReverse = this.playbackSpeed < 0;
-		let startTime = buffer[0].t;
+		let startTime = buffer.length > 0 ? buffer[0].t : 0;
 		let startX = this.mod(this.getX(startTime), width);
 		let endX = Math.floor(startX + this.getX(endTime - startTime));
 		startX = Math.floor(startX);
@@ -142,6 +146,39 @@ globalThis.bytebeat = new class {
 		// Drawing in a segment
 		const isWaveform = this.settings.drawMode === 'Waveform';
 		const isDiagram = this.settings.drawMode === 'Diagram';
+		const isFFT = this.settings.drawMode === 'FFT_1024';
+
+		// If FFT mode and analyser is available, draw spectrum instead of using drawBuffer
+if (isFFT && this.analyser && this.analyserData) {
+    this.analyser.getByteFrequencyData(this.analyserData);
+    this.clearCanvas();
+
+    this.canvasCtx.beginPath();
+    this.canvasCtx.strokeStyle = "white";
+    this.canvasCtx.lineWidth = 1;
+
+    const binCount = this.analyserData.length;
+    const logMin = 1;
+    const logMax = Math.log(binCount + 1);
+
+    for (let i = 0; i < binCount; i++) {
+        const value = this.analyserData[i]; // 0..255
+        const y = height - (value / 255) * height;
+
+        // log-based X mapping (like drawSpectrumLog)
+        const x = (Math.log(i + logMin) / logMax) * width;
+
+        if (i === 0) {
+            this.canvasCtx.moveTo(x, y);
+        } else {
+            this.canvasCtx.lineTo(x, y);
+        }
+    }
+
+    this.canvasCtx.stroke();
+    return;
+}
+
 		for (let i = 0; i < bufferLen; ++i) {
 			const curY = buffer[i].value;
 			const prevY = buffer[i - 1]?.value ?? [NaN, NaN, NaN];
@@ -475,14 +512,38 @@ globalThis.bytebeat = new class {
 	}
 	async initAudioContext() {
 		this.audioCtx = new AudioContext({ latencyHint: 'balanced', sampleRate: 48000 });
+
 		this.audioGain = new GainNode(this.audioCtx);
 		this.audioGain.connect(this.audioCtx.destination);
+
+		// Create an analyzer node for spectrum/FFT visualization
+		try {
+			this.analyser = this.audioCtx.createAnalyser();
+			this.analyser.fftSize = 1024; // FFT_1024
+			this.analyser.smoothingTimeConstant = 0.3;
+			this.analyserData = new Uint8Array(this.analyser.frequencyBinCount);
+		} catch (err) {
+			this.analyser = null;
+			this.analyserData = null;
+		}
+
 		await this.audioCtx.audioWorklet.addModule('./scripts/audioProcessor.mjs?version=2023022000');
+
 		this.audioWorkletNode = new AudioWorkletNode(this.audioCtx, 'audioProcessor',
 			{ outputChannelCount: [2] });
 		this.audioWorkletNode.port.addEventListener('message', e => this.receiveData(e.data));
 		this.audioWorkletNode.port.start();
-		this.audioWorkletNode.connect(this.audioGain);
+
+		// --- key change here ---
+		// connect processor to BOTH analyser and gain
+		// extra gain to prevent FFT clipping
+		this.analyserGain = new GainNode(this.audioCtx, { gain: 0.1 }); // scale down to 20%
+
+		this.audioWorkletNode.connect(this.analyserGain);
+		this.analyserGain.connect(this.analyser);
+
+		this.audioWorkletNode.connect(this.audioGain); // main output gain
+
 		const mediaDest = this.audioCtx.createMediaStreamDestination();
 		const audioRecorder = this.audioRecorder = new MediaRecorder(mediaDest.stream);
 		audioRecorder.addEventListener('dataavailable', e => this.audioRecordChunks.push(e.data));
@@ -500,6 +561,7 @@ globalThis.bytebeat = new class {
 		});
 		this.audioGain.connect(mediaDest);
 	}
+
 	initElements() {
 		// Containers
 		this.cacheParentElem = document.createElement('div');
@@ -885,10 +947,21 @@ globalThis.bytebeat = new class {
 			(value / this.songData.sampleRate).toFixed(2) : value;
 	}
 	setDrawMode() {
+		const prev = this.settings.drawMode;
 		this.settings.drawMode = this.controlDrawMode.value;
 		this.saveSettings();
-		this.sendData({ DMode: this.settings.drawMode })
+		this.sendData({ DMode: this.settings.drawMode });
+		// Clear canvas when switching between draw modes
+		if (prev !== this.settings.drawMode) {
+			this.clearCanvas();
+			this.drawBuffer = [];
+		}
+		// If switching to analyser-driven modes, ensure we have an animation loop
+		if ((this.settings.drawMode === 'FFT_1024' || this.settings.drawMode === 'DiagramSpectrum') && !this.isPlaying) {
+			this.requestAnimationFrame();
+		}
 	}
+
 	setFunction() {
 		this.sendData({ setFunction: this.editorValue });
 		MAT.seed(true)
